@@ -17,8 +17,11 @@ type WIM struct {
 	compression CompressionType
 	chunkSize   uint32
 
-	// SHA-1 hash → resource entry.
+	// SHA-1 hash → resource entry (deduplicated).
 	resources map[[20]byte]*resourceEntry
+	
+	// All metadata resources (preserves duplicates for image mapping).
+	metaResources []*resourceEntry
 
 	// Parsed XML manifest (UTF-8).
 	xmlBytes []byte
@@ -190,6 +193,11 @@ func (w *WIM) readLookupTable() error {
 			partNumber: e.Part,
 		}
 		w.resources[e.Hash] = re
+		
+		// Retain a raw list of all metadata resources to avoid map deduplication
+		if re.flags&resFlagMetadata != 0 {
+			w.metaResources = append(w.metaResources, re)
+		}
 	}
 	return nil
 }

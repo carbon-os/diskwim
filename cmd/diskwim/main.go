@@ -8,6 +8,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/carbon-os/diskiso"
 	"github.com/carbon-os/diskwim"
 )
 
@@ -23,7 +24,7 @@ func run() error {
 		usage()
 		return nil
 	}
-	wimPath := os.Args[1]
+	inputPath := os.Args[1]
 
 	// Flags
 	fs := flag.NewFlagSet("diskwim", flag.ContinueOnError)
@@ -34,9 +35,19 @@ func run() error {
 	getDst := fs.String("dest", "", "Destination path for --get")
 	applyFlag := fs.String("apply", "", "Extract full image to directory")
 	imageIdx := fs.Int("image", 1, "Image index (1-based)")
+	wimInISO := fs.String("wim", "", "Path to WIM inside ISO (default: auto-detect)")
 
 	if err := fs.Parse(os.Args[2:]); err != nil {
 		return err
+	}
+
+	// Resolve the WIM path — either directly or extracted from an ISO.
+	wimPath, cleanup, err := resolveWIM(inputPath, *wimInISO)
+	if err != nil {
+		return err
+	}
+	if cleanup != nil {
+		defer cleanup()
 	}
 
 	w, err := diskwim.Attach(wimPath)
@@ -47,7 +58,7 @@ func run() error {
 
 	switch {
 	case *infoFlag:
-		return cmdInfo(w, wimPath)
+		return cmdInfo(w, inputPath, wimPath)
 	case *lsFlag != "":
 		return cmdLS(w, *lsFlag, *imageIdx)
 	case *catFlag != "":
@@ -69,13 +80,94 @@ func run() error {
 	return nil
 }
 
-func cmdInfo(w *diskwim.WIM, path string) error {
-	fi, _ := os.Stat(path)
+// resolveWIM returns the path to a usable .wim/.esd file.
+//
+// If inputPath is an ISO, it mounts the ISO, finds the WIM (using wimHint or
+// auto-detection), copies it to a temp file, and returns the temp path along
+// with a cleanup func that removes it.  If inputPath is already a WIM/ESD the
+// path is returned unchanged with a nil cleanup.
+func resolveWIM(inputPath, wimHint string) (wimPath string, cleanup func(), err error) {
+	lower := strings.ToLower(inputPath)
+	if !strings.HasSuffix(lower, ".iso") {
+		return inputPath, nil, nil
+	}
+
+	disc, err := diskiso.Attach(inputPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("opening ISO: %w", err)
+	}
+	defer disc.Detach()
+
+	vol, err := disc.Mount()
+	if err != nil {
+		return "", nil, fmt.Errorf("mounting ISO: %w", err)
+	}
+
+	// Determine which WIM/ESD to use.
+	target := wimHint
+	if target == "" {
+		target, err = detectWIMPath(vol)
+		if err != nil {
+			return "", nil, err
+		}
+	}
+
+	fmt.Fprintf(os.Stderr, "ISO: using %s (%s)\n", target, vol.Label())
+
+	src, err := vol.Open(target)
+	if err != nil {
+		return "", nil, fmt.Errorf("opening %s in ISO: %w", target, err)
+	}
+	defer src.Close()
+
+	tmp, err := os.CreateTemp("", "diskwim-*.wim")
+	if err != nil {
+		return "", nil, fmt.Errorf("creating temp file: %w", err)
+	}
+
+	if _, err = io.Copy(tmp, src); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", nil, fmt.Errorf("extracting WIM from ISO: %w", err)
+	}
+	if err = tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return "", nil, err
+	}
+
+	return tmp.Name(), func() { os.Remove(tmp.Name()) }, nil
+}
+
+// detectWIMPath probes well-known locations inside a Windows ISO for a WIM or
+// ESD file, in preference order.
+func detectWIMPath(vol diskiso.Volume) (string, error) {
+	candidates := []string{
+		"/sources/install.wim",
+		"/sources/install.esd",
+		"/sources/boot.wim",
+	}
+	for _, p := range candidates {
+		if _, err := vol.Stat(p); err == nil {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf(
+		"no WIM/ESD found in ISO at known locations %v; use --wim to specify the path",
+		candidates,
+	)
+}
+
+// ── commands ──────────────────────────────────────────────────────────────────
+
+func cmdInfo(w *diskwim.WIM, displayPath, wimPath string) error {
+	// Show the original input path (ISO or WIM) to the user, but read size
+	// from the actual WIM on disk (may be a temp extract).
+	fi, _ := os.Stat(wimPath)
 	var size int64
 	if fi != nil {
 		size = fi.Size()
 	}
-	fmt.Printf("File   : %s (%s)\n", path, fmtBytes(size))
+	fmt.Printf("File   : %s (%s)\n", displayPath, fmtBytes(size))
 	fmt.Printf("Codec  : %s\n", w.Compression())
 	fmt.Printf("Images : %d\n\n", len(w.Images()))
 
@@ -84,8 +176,7 @@ func cmdInfo(w *diskwim.WIM, path string) error {
 	fmt.Fprintln(tw, "-----\t-------\t----\t-----\t----")
 	for _, img := range w.Images() {
 		root, err := img.Root()
-		var files int64
-		var sz int64
+		var files, sz int64
 		if err == nil && root != nil {
 			files = root.FileCount()
 			sz = root.TotalSize()
@@ -221,9 +312,14 @@ func fmtInt(n int64) string {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `Usage:
-  diskwim <file.wim|file.esd> --info
-  diskwim <file.wim|file.esd> --ls   <path>  [--image N]
-  diskwim <file.wim|file.esd> --cat  <path>  [--image N]
-  diskwim <file.wim|file.esd> --get  <path>  <dest>    [--image N]
-  diskwim <file.wim|file.esd> --apply <dest-dir>        [--image N]`)
+  diskwim <file.wim|file.esd|file.iso> --info
+  diskwim <file.wim|file.esd|file.iso> --ls   <path>  [--image N]
+  diskwim <file.wim|file.esd|file.iso> --cat  <path>  [--image N]
+  diskwim <file.wim|file.esd|file.iso> --get  <path>  <dest>    [--image N]
+  diskwim <file.wim|file.esd|file.iso> --apply <dest-dir>        [--image N]
+
+ISO options:
+  --wim <path>   Path to the WIM/ESD inside the ISO
+                 (default: auto-detects /sources/install.wim,
+                  /sources/install.esd, /sources/boot.wim)`)
 }

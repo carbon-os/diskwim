@@ -1,0 +1,4 @@
+github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
+github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
+github.com/carbon-os/diskiso v0.0.0-20260512032318-28f69c98239d h1:jr6010xiXxx5Jk62BPAxRpZxCdL7hXNjWGu7JsjHrWs=
+github.com/carbon-os/diskiso v0.0.0-20260512032318-28f69c98239d/go.mod h1:kj2i1C1H74vn2YJ5wvlBfpWFNO+bXTCvwNA7AR1/oV4=

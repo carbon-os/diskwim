@@ -3,12 +3,13 @@ package diskwim
 import (
 	"fmt"
 	"strings"
+	"sort"
 )
 
 // Image represents one deployable image within a WIM file.
 type Image struct {
 	wim   *WIM
-	index int      // 1-based
+	index int       // 1-based
 	meta  *xmlImage // from XML manifest, may be nil
 
 	// Lazy-loaded root node.
@@ -56,27 +57,29 @@ func (img *Image) Root() (*Node, error) {
 	if img.root != nil {
 		return img.root, nil
 	}
-	// Find the metadata resource for this image.
-	// Metadata resources are stored in the lookup table with the METADATA flag
-	// and appear in the order they are declared in the XML (image index order).
-	metaIdx := 0
-	for _, re := range img.wim.resources {
-		if re.flags&resFlagMetadata != 0 {
-			metaIdx++
-			if metaIdx == img.index {
-				data, err := img.wim.readResource(re, 0)
-				if err != nil {
-					return nil, fmt.Errorf("diskwim: image %d: read metadata: %w", img.index, err)
-				}
-				root, err := parseMeta(data)
-				if err != nil {
-					return nil, fmt.Errorf("diskwim: image %d: parse metadata: %w", img.index, err)
-				}
-				img.wim.lookupSizes(root)
-				img.root = root
-				return root, nil
-			}
+
+	// Copy the WIM's metadata resources and sort by their offset.
+	// The WIM spec stores metadata resources in image-index order, so the
+	// i-th entry (0-based) corresponds to image index i+1.
+	metas := make([]*resourceEntry, len(img.wim.metaResources))
+	copy(metas, img.wim.metaResources)
+	sort.Slice(metas, func(i, j int) bool {
+		return metas[i].offset < metas[j].offset
+	})
+
+	if img.index >= 1 && img.index <= len(metas) {
+		re := metas[img.index-1]
+		data, err := img.wim.readResource(re, 0)
+		if err != nil {
+			return nil, fmt.Errorf("diskwim: image %d: read metadata: %w", img.index, err)
 		}
+		root, err := parseMeta(data)
+		if err != nil {
+			return nil, fmt.Errorf("diskwim: image %d: parse metadata: %w", img.index, err)
+		}
+		img.wim.lookupSizes(root)
+		img.root = root
+		return root, nil
 	}
 
 	// Fallback: use the boot metadata resource for image 1.

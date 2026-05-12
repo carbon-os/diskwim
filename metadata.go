@@ -10,8 +10,8 @@ import (
 // ── XML manifest types ────────────────────────────────────────────────────────
 
 type wimXMLDoc struct {
-	TotalBytes int64       `xml:"TOTALBYTES"`
-	Images     []xmlImage  `xml:"IMAGE"`
+	TotalBytes int64      `xml:"TOTALBYTES"`
+	Images     []xmlImage `xml:"IMAGE"`
 }
 
 type xmlImage struct {
@@ -41,7 +41,7 @@ func parseMeta(data []byte) (*Node, error) {
 	metaStart := (secDataSize + 7) &^ 7
 
 	p := &metaParser{data: data}
-	root, err := p.parseDentry(int64(metaStart))
+	root, _, err := p.parseDentry(int64(metaStart))
 	if err != nil {
 		return nil, fmt.Errorf("diskwim: parse root dentry: %w", err)
 	}
@@ -51,6 +51,14 @@ func parseMeta(data []byte) (*Node, error) {
 	if err := p.populateChildren(root); err != nil {
 		return nil, err
 	}
+
+	// WIM format quirk: "Double root". WIMGAPI often wraps the actual root directory
+	// inside a dummy root directory that also has an empty name. We unwrap it here
+	// so the caller interacts directly with the true filesystem root.
+	for len(root.Children) == 1 && root.Children[0].Name == "" && root.Children[0].IsDir {
+		root = root.Children[0]
+	}
+
 	return root, nil
 }
 
@@ -58,91 +66,87 @@ type metaParser struct {
 	data []byte
 }
 
-// dentry on-disk layout (variable length, 8-byte aligned):
-//   [0:8]   length of this entry (8-byte aligned, 0 = end of directory)
-//   [8:4]   file attributes
-//   [12:4]  security descriptor index (-1 = none)
-//   [16:8]  subdirectory offset (from start of metadata resource)
-//   [24:8]  unused
-//   [32:8]  unused
-//   [40:8]  creation time (FILETIME)
-//   [48:8]  last access time (FILETIME)
-//   [56:8]  last write time (FILETIME)
-//   [64:20] SHA-1 hash
-//   [84:4]  reparse tag
-//   [88:4]  reparse reserved
-//   [92:8]  hard link ID
-//   [100:2] number of ADS entries
-//   [102:2] short name size
-//   [104:2] name size
-//   [106:…] short name (UTF-16LE, no null)
-//   […:…]   name (UTF-16LE, no null)
-//   padding to 8-byte boundary
-//   ADS entries …
-
-const dentryFixedSize = 106
-
-func (p *metaParser) parseDentry(off int64) (*Node, error) {
+func (p *metaParser) parseDentry(off int64) (*Node, int64, error) {
 	if off+8 > int64(len(p.data)) {
-		return nil, fmt.Errorf("diskwim: dentry offset 0x%x out of range", off)
+		return nil, 0, nil
 	}
+
 	length := int64(binary.LittleEndian.Uint64(p.data[off:]))
 	if length == 0 {
-		return nil, nil // end of directory marker
+		return nil, 8, nil
 	}
-	if length < dentryFixedSize || off+length > int64(len(p.data)) {
-		return nil, fmt.Errorf("diskwim: dentry at 0x%x has invalid length %d", off, length)
+
+	// 102 is the smallest valid fixed dentry (through wStreams at offset 100).
+	// Root dentries with no name are commonly written as 102 or 104 bytes.
+	if length < 102 || off+length > int64(len(p.data)) {
+		return nil, 0, fmt.Errorf("diskwim: dentry at 0x%x has invalid length %d", off, length)
 	}
 	d := p.data[off:]
 
-	attrs := binary.LittleEndian.Uint32(d[8:])
-	subdirOff := int64(binary.LittleEndian.Uint64(d[16:]))
+	attrs      := binary.LittleEndian.Uint32(d[8:])
+	subdirOff  := int64(binary.LittleEndian.Uint64(d[16:]))
 	creationTime := filetimeToTime(binary.LittleEndian.Uint64(d[40:]))
-	accessTime := filetimeToTime(binary.LittleEndian.Uint64(d[48:]))
-	modTime := filetimeToTime(binary.LittleEndian.Uint64(d[56:]))
+	accessTime   := filetimeToTime(binary.LittleEndian.Uint64(d[48:]))
+	modTime      := filetimeToTime(binary.LittleEndian.Uint64(d[56:]))
+
 	var hash [20]byte
 	copy(hash[:], d[64:84])
+
+	// d[84:88]  = dwReparseTag      (skipped)
+	// d[88:92]  = dwReparseReserved (skipped)
 	hardLink := int64(binary.LittleEndian.Uint64(d[92:]))
-	adsCount := int(binary.LittleEndian.Uint16(d[100:]))
-	shortNameSize := int(binary.LittleEndian.Uint16(d[102:]))
-	nameSize := int(binary.LittleEndian.Uint16(d[104:]))
 
-	cursor := int64(dentryFixedSize)
-	if cursor+int64(shortNameSize) > length {
-		return nil, fmt.Errorf("diskwim: dentry short name out of bounds")
+	// Fields at 100, 102, 104 may not be present in very short dentries.
+	var streamCount, nameSize int
+	if length >= 102 {
+		streamCount = int(binary.LittleEndian.Uint16(d[100:]))
 	}
-	cursor += int64(shortNameSize)
-	// Pad to 2-byte alignment before name.
-	if cursor%2 != 0 {
-		cursor++
+	if length >= 106 {
+		nameSize = int(binary.LittleEndian.Uint16(d[104:]))
 	}
-	if cursor+int64(nameSize) > length {
-		return nil, fmt.Errorf("diskwim: dentry name out of bounds")
-	}
-	name := utf16ToString(d[cursor : cursor+int64(nameSize)])
-	cursor += int64(nameSize)
 
-	// Align to 8 bytes.
-	cursor = (cursor + 7) &^ 7
+	// Long filename is at offset 106 per the MS spec (FileName[0] field).
+	// Short name lives after the long name; we don't need it for tree walking.
+	var name string
+	if nameSize > 0 && 106+int64(nameSize) <= length {
+		name = utf16ToString(d[106 : 106+int64(nameSize)])
+	}
 
-	// Parse ADS entries to find the default data stream hash.
+	alignedLength := (length + 7) &^ 7
+	streamOff := off + alignedLength
 	streamHash := hash
-	for i := 0; i < adsCount && cursor < length; i++ {
-		adsHash, _, adsLen, err := p.parseADS(off + cursor)
-		if err != nil {
+
+	for i := 0; i < streamCount; i++ {
+		if streamOff+8 > int64(len(p.data)) {
 			break
 		}
-		// ADS with empty name is the unnamed data stream.
-		// (We'll use the hash found in the dentry itself for the default stream.)
-		_ = adsHash
-		cursor += adsLen
+		sLen := int64(binary.LittleEndian.Uint64(p.data[streamOff:]))
+		if sLen < 38 || streamOff+sLen > int64(len(p.data)) {
+			break
+		}
+
+		var sHash [20]byte
+		copy(sHash[:], p.data[streamOff+16:streamOff+36])
+
+		sNameSize := int(binary.LittleEndian.Uint16(p.data[streamOff+36:]))
+		var sName string
+		if sNameSize > 0 && 38+int64(sNameSize) <= sLen {
+			sName = utf16ToString(p.data[streamOff+38 : streamOff+38+int64(sNameSize)])
+		}
+		if i == 0 && sName == "" {
+			streamHash = sHash
+		}
+
+		streamOff += (sLen + 7) &^ 7
 	}
 
-	isDir := attrs&0x10 != 0 // FILE_ATTRIBUTE_DIRECTORY
+	consumed := streamOff - off
+
+	isDir := attrs&0x10 != 0
 	node := &Node{
 		Name:         name,
 		Attributes:   attrs,
-		Size:         0, // filled in from lookup table
+		Size:         0,
 		CreationTime: creationTime,
 		AccessTime:   accessTime,
 		ModTime:      modTime,
@@ -152,32 +156,9 @@ func (p *metaParser) parseDentry(off int64) (*Node, error) {
 		subdirOffset: subdirOff,
 	}
 	if isDir {
-		node.Hash = [20]byte{} // directories have no data hash
+		node.Hash = [20]byte{}
 	}
-	return node, nil
-}
-
-// parseADS parses an alternate data stream entry at the given offset.
-// Returns (hash, name, byteLength, error).
-func (p *metaParser) parseADS(off int64) ([20]byte, string, int64, error) {
-	d := p.data[off:]
-	if len(d) < 38 {
-		return [20]byte{}, "", 0, fmt.Errorf("diskwim: ADS entry too short")
-	}
-	length := int64(binary.LittleEndian.Uint64(d[0:]))
-	if length < 38 || off+length > int64(len(p.data)) {
-		return [20]byte{}, "", 0, fmt.Errorf("diskwim: ADS entry length %d invalid", length)
-	}
-	var hash [20]byte
-	copy(hash[:], d[16:36])
-	nameSize := int(binary.LittleEndian.Uint16(d[36:]))
-	var name string
-	if nameSize > 0 && 38+nameSize <= int(length) {
-		name = utf16ToString(d[38 : 38+nameSize])
-	}
-	// ADS entries are padded to 8-byte boundary.
-	aligned := (length + 7) &^ 7
-	return hash, name, aligned, nil
+	return node, consumed, nil
 }
 
 // populateChildren recursively fills the Children slice for all directory Nodes.
@@ -187,37 +168,26 @@ func (p *metaParser) populateChildren(node *Node) error {
 	}
 	off := node.subdirOffset
 	for {
-		child, err := p.parseDentry(off)
+		child, consumed, err := p.parseDentry(off)
 		if err != nil {
 			return fmt.Errorf("diskwim: parse child at 0x%x: %w", off, err)
 		}
 		if child == nil {
 			break
 		}
-		// Skip dot and dotdot.
+
+		off += consumed // already 8-byte aligned; no second realignment needed
+
 		if child.Name == "." || child.Name == ".." {
-			off += p.dentryTotalLength(off)
 			continue
 		}
+
 		node.Children = append(node.Children, child)
 		if err := p.populateChildren(child); err != nil {
 			return err
 		}
-		off += p.dentryTotalLength(off)
 	}
 	return nil
-}
-
-// dentryTotalLength returns the 8-byte-aligned total length of the dentry at off.
-func (p *metaParser) dentryTotalLength(off int64) int64 {
-	if off+8 > int64(len(p.data)) {
-		return 8
-	}
-	l := int64(binary.LittleEndian.Uint64(p.data[off:]))
-	if l < 8 {
-		return 8
-	}
-	return (l + 7) &^ 7
 }
 
 // filetimeToTime converts a Windows FILETIME (100-ns ticks since 1601-01-01)

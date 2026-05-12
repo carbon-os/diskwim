@@ -50,6 +50,15 @@ func (h *huffDecoder) build(lengths []uint8) error {
 		}
 	}
 
+	// Prevent out-of-bounds panics by validating Kraft inequality (oversubscription)
+	var capacity uint32
+	for bits := 1; bits <= maxLen; bits++ {
+		capacity += uint32(count[bits]) << uint(maxHuffBits-bits)
+	}
+	if capacity > (1 << maxHuffBits) {
+		return fmt.Errorf("huffman: invalid tree (oversubscribed)")
+	}
+
 	// First canonical code per length.
 	code := [maxHuffBits + 1]uint16{}
 	var c uint16
